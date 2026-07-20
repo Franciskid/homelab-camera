@@ -70,13 +70,13 @@ ffmpeg pulls the RTSP stream of each camera and writes HLS segments to disk. The
 
 ### Motion detection
 
-Every 5 seconds the app runs ffmpeg scene detection on the newest HLS segment of each camera. No extra decode pipeline, the segments are already there. Sensitivity is per camera. A big global score means a day/night or exposure change, so it gets ignored instead of spamming clips. PTZ moves and light toggles also suppress detection for a few seconds.
+Every 5 seconds the app runs ffmpeg scene detection on the newest HLS segment of each camera. No extra decode pipeline as the segments are already there. Sensitivity is per camera. A big global score means a day/night or exposure change, so it gets ignored instead of spamming clips. PTZ moves and light toggles also suppress detection for a few seconds.
 
 When motion stops, the clip is cut from segments already on disk, with pre and post roll around the event. So recording a clip costs almost nothing.
 
 ### Archive and AI analysis
 
-Each clip is uploaded to MinIO as mp4 plus a metadata JSON. Then the app samples a few frames from the clip and sends them to a small FastAPI router. The router does no real work: it checks the caller is allowed, then forwards the request to LiteLLM, which routes to a vision model (cloud or locally hosted). The model answers with strict JSON: category (person, animal, vehicle, package, other, nothing), a short label, a confidence and a one sentence summary. That result is saved on the clip and shown in the event timeline.
+Each clip is uploaded to MinIO as mp4 plus a metadata JSON. Then the app samples a few frames from the clip and sends them to a small FastAPI router. The router does no real work: it checks the caller is allowed, then forwards the request to LiteLLM, which routes to a vision model (cloud or locally hosted, it goes through an internal platform I made which allows for easy routing between cloud and local models). The model answers with strict JSON: category (person, animal, vehicle, package, other, nothing), a short label, a confidence and a one sentence summary. That result is saved on the clip and shown in the event timeline.
 
 Frame count, sampling mode and model are configurable from the UI without a restart.
 
