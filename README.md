@@ -17,50 +17,7 @@ The code is private, this repo is just here to show how it works.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph lan["Home LAN"]
-        cam1["Dahua PTZ camera"]
-        cam2["Garage camera"]
-        cam3["Tapo camera"]
-    end
-
-    subgraph server["Homelab server (Docker)"]
-        subgraph app["Camera app (Node.js)"]
-            ffmpeg["ffmpeg transcoder<br/>RTSP to HLS"]
-            motion["Motion detection<br/>ffmpeg scene score"]
-            store["Recording store<br/>clips + JSON metadata"]
-            ptz["PTZ control<br/>Python, ONVIF / dvrip"]
-            web["Web + API<br/>PWA, hls.js player"]
-        end
-        minio["MinIO S3<br/>clip archive"]
-        router["AI router (FastAPI)<br/>auth check, forward only"]
-        litellm["LiteLLM"]
-    end
-
-    subgraph net["Internet"]
-        cf["Cloudflare<br/>DNS, WAF"]
-        proxy["Reverse proxy<br/>HTTPS"]
-        sso["SSO (OIDC)"]
-    end
-
-    phone["iPhone PWA"]
-
-    cam1 -- "RTSP" --> ffmpeg
-    cam2 -- "RTSP" --> ffmpeg
-    cam3 -- "RTSP" --> ffmpeg
-    ptz -- "commands" --> cam1
-    ffmpeg -- "HLS segments" --> web
-    ffmpeg --> motion
-    motion -- "cut clip" --> store
-    store -- "mp4 + metadata" --> minio
-    store -- "sampled frames" --> router
-    router --> litellm
-    litellm -- "vision model,<br/>cloud or local" --> router
-    router -- "JSON result" --> store
-    phone --> cf --> proxy --> web
-    web -.-> sso
-```
+![Architecture](architecture.svg)
 
 ## How it works
 
