@@ -19,6 +19,8 @@ The code is private, this repo is just here to show how it works.
 
 ![Architecture](architecture.svg)
 
+Two sites. The cameras and the camera app live at the remote site, on a small server. Clips and AI requests go over the internet, through Cloudflare, to the homelab core where MinIO, the AI router, LiteLLM and the SSO run.
+
 ## How it works
 
 ### Live streaming
