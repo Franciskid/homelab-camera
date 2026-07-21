@@ -17,9 +17,9 @@ The code is private, this repo is just here to show how it works.
 
 ## Architecture
 
-![Architecture](architecture.svg)
+![Architecture](architecture.png)
 
-Two sites. The cameras and the camera app live at the remote site, on a small server. Clips and AI requests go over the internet, through Cloudflare, to the homelab core where MinIO, the AI router, LiteLLM and the SSO run.
+Two edge sites feed one homelab core. Camera 2 sends its RTSP stream through a site-to-site tunnel to Edge Site 1. The Node.js camera app at Edge Site 1 receives both cameras and performs all FFmpeg streaming, motion detection, recording and clip processing. Clips and AI requests then travel over the public internet through Cloudflare to the homelab core, where MinIO, the FastAPI AI router, LiteLLM and SSO run.
 
 ## How it works
 
