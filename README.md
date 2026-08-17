@@ -39,19 +39,15 @@ Every 5 seconds the app looks at the newest HLS segment of each camera and runs 
 
 ```mermaid
 flowchart TD
-  seg["newest HLS segment<br/>already on disk for live"] --> seen{"same segment<br/>as last tick?"}
-  seen -->|yes| skip["nothing spawned"]
-  seen -->|no| sup{"camera suppressed?"}
-  sup -->|"PTZ 12s, light 45s, cooldown"| skip
-  sup -->|no| score["one ffmpeg pass<br/>scene score, 5s timeout"]
-  score --> hit{"any score over<br/>the threshold?"}
-  hit -->|no| skip
-  hit -->|yes| glob{"max score<br/>over 0.35?"}
-  glob -->|yes| night["whole frame changed<br/>sleep 45s, no clip"]
-  glob -->|no| sess["open or extend<br/>motion session"]
-  sess --> quiet["post-roll plus 1s<br/>with no movement"]
-  quiet --> cut["cut clip from segments on disk<br/>anchored on the first frame that moved"]
-  cut --> up["mp4 and metadata JSON to S3"]
+  seg["newest HLS segment, already on disk for live"] --> gate{"new segment?<br/>not suppressed?"}
+  gate -->|"no: same segment, or PTZ 12s, light 45s, cooldown"| skip["nothing spawned"]
+  gate -->|yes| score["one ffmpeg pass, scene score<br/>2 to 4 fps, 160 to 320 px, 5s timeout"]
+  score --> verdict{"scene score"}
+  verdict -->|"under threshold"| skip
+  verdict -->|"over 0.35, whole frame moved"| night["day/night or IR light<br/>sleep 45s, no clip"]
+  verdict -->|"over threshold"| sess["motion session opens,<br/>extends while things keep moving"]
+  sess -->|"post-roll plus 1s of quiet"| cut["clip cut from segments on disk,<br/>anchored on the first frame that moved"]
+  cut --> s3["mp4 and metadata JSON to S3"]
 ```
 
 Sensitivity is per camera, and it is not only a threshold. Each level also changes how the segment gets sampled, because a cat at the far end of a field and a car at the gate are not the same detection problem:
