@@ -4,6 +4,12 @@ Self hosted camera viewer and NVR running on my homelab. Live view, DVR timeline
 
 The code is private, this repo is just here to show how it works.
 
+## Demo
+
+![Demo of the web app](demo.gif)
+
+Live view of both cameras, then the camera page with its DVR timeline and gate history, the recorded events with clip playback, the alert dashboard with the AI analysis of a clip, and the settings. Sped up 2.4x. The app has a capture mode (`?anonymize=1`) that blurs the video, renames the cameras and hides network details, which is what you see here.
+
 ## Features
 
 - Live HLS streaming of all cameras, with a low latency profile (~2s) and a balanced one
