@@ -59,7 +59,7 @@ Sensitivity is per camera, and it is not only a threshold. Each level also chang
 | medium | 0.035 | 2 fps | 160 px wide |
 | large | 0.07 | 2 fps | 160 px wide |
 
-Most of the work after that is deciding what to ignore. A scene score above 0.35 means the whole frame changed at once, which is a day/night switch or the IR light kicking in rather than something moving through the garden, so detection sleeps for 45 seconds instead of saving a clip nobody wants. Moving the camera or toggling its light suppresses it too, for 12 and 45 seconds, since a PTZ pan changes every pixel by definition.
+Most of the work after that is deciding what to ignore. A scene score above 0.35 means the whole frame changed at once, which is a day/night switch or the IR light kicking in rather than something moving through the garden, so detection sleeps for a few seconds instead of saving a clip nobody wants. Moving the camera or toggling its light suppresses it too, for a few seconds, since a PTZ pan changes every pixel by definition.
 
 Movement opens a session instead of firing a clip immediately. The session extends while things keep moving and closes one second after the post-roll runs out, because the segment holding the end of the event is only readable once it has been fully written. The clip is then cut from segments already on disk, anchored on the first frame that moved and stretched across the whole session. That way a slow walk up the drive is filmed from the start of the approach, not from wherever "fifteen seconds back from now" happened to land.
 
@@ -84,9 +84,7 @@ flowchart LR
   local -->|"strict JSON"| app
 ```
 
-The router does almost nothing on purpose: it checks the caller is allowed, then forwards. Model choice, keys, rate limits and usage history all live in LiteLLM, which is part of a small AI platform I built for the homelab and share between projects. Swapping a cloud model for a locally hosted one is an alias change on that side, and the camera app does not move. Frame count, sampling mode and model are editable from the UI without a restart.
-
-The clip URL rides along as request metadata so the platform can attribute usage. LiteLLM does not forward metadata to the model, so only the sampled frames ever reach it.
+The router does almost nothing on purpose: it checks the caller is allowed, then forwards. Model choice, keys, rate limits and usage history all live in LiteLLM, which is part of a small AI platform I built for the homelab and share between projects. Swapping a cloud model for a locally hosted one is an alias change on that side. Frame count, sampling mode and model are editable directly from the UI
 
 The model has to answer in this shape and nothing else. Free text fields come back in French, like the rest of the app:
 
@@ -107,8 +105,6 @@ The model has to answer in this shape and nothing else. Free text fields come ba
 The answer then gets checked rather than trusted, which is most of the code in that path:
 
 - Species are restricted to a fixed vocabulary, so the model cannot name an animal the notification settings have no rule for.
-- A claim of a person or a vehicle with nothing counted behind it is rewritten to `nothing`. That is a sentence about a dark patch of grass, not a detection.
-- A missing confidence is not treated as a low confidence, because some models simply never fill the field.
 - When the local tracker has already confirmed a line crossing from a stable trajectory, the prompt states it as fact and the model is not allowed to argue with the geometry.
 
 ### Auth
@@ -125,6 +121,4 @@ Node.js + Express, ffmpeg, hls.js, Python (onvif, dvrip), FastAPI, LiteLLM, MinI
 
 ## About the code
 
-The code is private and stays private. It is the software watching my own house, and publishing it next to a diagram of where the cameras sit and how the tunnels run is not a trade I want to make. This repo is the write-up instead.
-
-Happy to walk through the real thing in a call, including the parts that are ugly.
+The code is private as it is the software watching my own house, and publishing it next to a diagram of where the cameras sit and how the tunnels run is not something i want to show. This repo is the write-up instead.
