@@ -69,11 +69,11 @@ Every 5 seconds the app reads the newest live segment of each camera and runs on
 ```mermaid
 flowchart TD
   seg["newest HLS segment, already on disk for the live view"] --> gate{"new segment?<br/>not suppressed?"}
-  gate -->|"no: same segment, or PTZ 12 s, light 45 s, cooldown"| skip["spawn nothing"]
+  gate -->|"no: same segment, or a suppression window"| skip["spawn nothing"]
   gate -->|yes| score["one ffmpeg pass, scene score<br/>2 to 4 fps, 160 to 320 px, 5 s timeout"]
   score --> verdict{"scene score"}
   verdict -->|"below the threshold"| skip
-  verdict -->|"above 0.35, the whole frame moved"| night["day/night switch or IR light<br/>sleep 45 s, no clip"]
+  verdict -->|"above 0.35, the whole frame moved"| night["day/night switch or IR light<br/>short sleep, no clip"]
   verdict -->|"above the threshold"| sess["motion session opens<br/>and extends while movement continues"]
   sess -->|"post-roll plus 1 s of quiet"| cut["cut the clip from the segments on disk,<br/>anchored on the first frame that moved"]
   cut --> s3["mp4 and metadata JSON to S3"]
@@ -88,7 +88,7 @@ Sensitivity is a per-camera setting, and it changes more than a threshold. Each 
 | medium | 0.035 | 2 fps | 160 px wide |
 | large | 0.07 | 2 fps | 160 px wide |
 
-Most of the remaining logic decides what to ignore. A scene score above 0.35 means that the whole frame changed at one time. That is a day/night switch or the IR light, not a subject in the garden. Detection then sleeps for 45 seconds and saves no clip. A PTZ move suppresses detection for 12 seconds and a light change for 45 seconds, because a pan changes every pixel.
+Most of the remaining logic decides what to ignore. A scene score above 0.35 means that the whole frame changed at one time. That is a day/night switch or the IR light, not a subject in the garden. Detection then sleeps for a few seconds and saves no clip. A PTZ move and a light change suppress detection for a few seconds too, because a pan changes every pixel.
 
 Movement opens a session; it does not fire a clip immediately. The session extends while movement continues. It closes one second after the post-roll, because the segment that holds the end of the event is only readable when complete. The app then cuts the clip from the segments on disk, anchored on the first frame that moved and stretched over the whole session. A slow walk up the drive is therefore filmed from the start of the approach, not from a fixed offset before the present.
 
@@ -157,7 +157,7 @@ flowchart LR
   local -->|"strict JSON"| app
 ```
 
-The router does very little on purpose: it authorizes the caller, then forwards. Model choice, keys, rate limits and usage history live in LiteLLM. LiteLLM belongs to a small AI platform I built for the homelab and share between projects. To replace a cloud model with a local one I change an alias on that side; the camera app does not move. Frame count, sampling mode and model are UI settings and need no restart. The clip URL travels as request metadata for usage attribution, and LiteLLM does not forward metadata to the model, so only the frames reach it.
+The router does very little on purpose: it authorizes the caller, then forwards. Model choice, keys, rate limits and usage history live in LiteLLM. LiteLLM belongs to a small AI platform I built for the homelab and share between projects. To replace a cloud model with a local one I change an alias on that side; the camera app does not move. Frame count, sampling mode and model are UI settings and need no restart.
 
 The model must answer in this shape and nothing else. Free-text fields come back in French, like the rest of the app:
 
@@ -178,11 +178,9 @@ The model must answer in this shape and nothing else. Free-text fields come back
 The app checks that answer instead of trusting it. Those checks are most of the code on this path:
 
 - The species vocabulary is fixed, and the prompt quotes it from the same list the notification settings render. The model cannot name an animal that has no rule behind it.
-- A claim of a person or a vehicle with nothing counted behind it becomes `nothing`. That is a sentence about a dark patch of grass, not a detection.
 - An animal below 0.6 confidence is a guess about a dark shape. That threshold exists because such guesses filled one camera history with animals that were branches.
-- A missing confidence is not a low confidence, because some models never fill the field.
 - When the tracker already confirmed a crossing from a stable trajectory, the prompt states it as a fact. The model may not contradict the geometry. When no trajectory confirms them, the app strips the words `crossing`, `entrée` and `sortie` from the label and the summary.
-- DVR windows can overlap. Two clips of the same threshold, direction and crossing instant within 8 seconds stay both readable, The second carries `duplicateOf`: it raises no second notification, and its people count one time in the statistics.
+- DVR windows can overlap. Two clips of the same threshold, direction and crossing instant within 8 seconds both stay readable. The second carries `duplicateOf`: it raises no second notification, and its people count one time in the statistics.
 - A reasoning model can end its budget before it emits the JSON. The app retries an empty or malformed answer exactly one time, and a genuine `unknown` stays valid.
 
 ## Alerts, reports and export
