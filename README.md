@@ -1,56 +1,85 @@
 # Homelab camera
 
-Self hosted camera viewer and NVR running on my homelab. Live view, DVR timeline, PTZ, motion detection and AI analysis of every clip, all in a PWA installed on my phone.
+Self-hosted NVR and camera viewer. It streams two IP cameras and cuts a clip when something moves. It counts the people and vehicles that cross a drawn threshold, and sends every clip to a vision model. The client is an installable PWA.
 
-In daily use since May 2026. Two cameras across two sites, about 1200 clips and 10 GB of footage under retention, roughly 2s live latency. 181 commits, around 26k lines of app code with 70 test files.
+The system went into production in May 2026 and runs every day. It watches my own property, so the numbers below come from the live deployment.
 
 ## Demo
 
 ![Demo of the web app](demo.gif)
 
-Live view of both cameras, then the camera page with its DVR timeline and gate history, the recorded events with clip playback, the alert dashboard with the AI analysis of a clip, and the settings. Sped up 2.4x. The app has a capture mode (`?anonymize=1`) that blurs the video, renames the cameras and hides network details, which is what you see here.
+The clip shows the live view of both cameras, then the camera page with its DVR timeline and gate history. It then shows the event history with clip playback, the alert page with the analysis of one clip, and the settings. Playback is 2.4x. The app has a capture mode (`?anonymize=1`) that blurs the video, renames the cameras and hides the network details.
 
-## Features
+## Production status
 
-- Live HLS streaming of all cameras, with a low latency profile (~2s) and a balanced one
-- DVR timeline to scrub back in time, with quality selection and retention pruning
-- PTZ and white light control on cameras that support it
-- Motion detection with per camera sensitivity, clips saved with pre and post roll
-- Clips archived to S3 (MinIO) with their metadata
-- AI analysis of each clip: category, label, confidence and a one sentence summary, shown in the event timeline
-- SSO login, group based rights (viewer, PTZ, admin)
-- Installable PWA with offline fallback
+| Item | Value |
+| --- | --- |
+| Cameras | 2, on 2 sites |
+| Live latency | about 2 s, with 1-second HLS segments |
+| DVR depth | 24 h for each camera |
+| Clips under retention | 922 |
+| Disk in use | 31 GB: 17 GB of clips, 12 GB of HLS segments |
+| Application code | about 49 000 lines |
+| Tests | 105 files, about 18 000 lines |
+| Commits | 275 |
 
 ## Architecture
 
 ![Architecture](architecture.png)
 
-Two edge sites feed one homelab core. Camera 2 sends its RTSP stream through a site-to-site tunnel to Edge Site 1. The Node.js camera app at Edge Site 1 receives both cameras and performs all FFmpeg streaming, motion detection, recording and clip processing. Clips and AI requests then travel over the public internet through Cloudflare to the homelab core, where MinIO, the FastAPI AI router, LiteLLM and SSO run.
+Two edge sites feed one homelab core. Camera 2 sends its RTSP stream to edge site 1 through a site-to-site tunnel. The Node.js app at edge site 1 receives both cameras and does all the ffmpeg work: streams, detection, recordings and clip cuts. Clips and analysis requests then cross the public internet through Cloudflare to the homelab core. The core runs MinIO, a FastAPI router, LiteLLM and the identity provider.
 
-## How it works
+Both edge hosts are 6-core Intel CPUs with no GPU. Every model in the detection path runs on the CPU.
 
-### Live streaming
+## Video pipeline
 
-ffmpeg pulls the RTSP stream of each camera and writes HLS segments to disk. The PWA plays them with hls.js. Two profiles: low latency (1s segments) for live watching, balanced (2s) when the connection is worse. A separate DVR copy is kept for the timeline, pruned by retention settings so the disk does not fill up. Defaults are a 20 GB video quota and an 8 GB free disk floor, both editable from the UI.
+One ffmpeg process serves each camera. It decodes the RTSP feed one time and writes two HLS renditions.
 
-### Motion detection
+```mermaid
+flowchart LR
+  cam["camera RTSP"] --> ff["one ffmpeg process per camera<br/>one decode"]
+  ff -->|"stream copy, no encode"| live["live segments<br/>native resolution, 7 min on disk"]
+  ff -->|"scale + x264"| dvr["DVR segments<br/>720p, 24 h on disk"]
+  live --> master["master playlist<br/>two variants"]
+  dvr --> master
+  master --> player["hls.js in the PWA"]
+  dvr --> clip["clip cut"]
+  live --> track["attention tracker<br/>reads a rendition 960 px or wider"]
+  dvr --> track
+```
 
-Every 5 seconds the app looks at the newest HLS segment of each camera and runs ffmpeg scene detection on it. The segments are already on disk for the live stream, so detection is one short ffmpeg call per camera and there is no second decode pipeline to feed. If the newest segment is the same one as last tick, nothing gets spawned at all.
+The live rendition is a stream copy: no decode, no encode, no quality loss and no CPU cost. The DVR rendition is the only encode, and its height is a user setting. The player reads the master playlist and selects the native copy for quality, or the DVR rendition on a weak connection. Both playlists carry `EXT-X-PROGRAM-DATE-TIME` on every segment, so any segment maps to the wall clock without a count backwards from the end of the file.
+
+Segment duration controls the disk cost more than the encoder quality does. Each segment must start on a keyframe, and at 720p the keyframes are most of the archive. Measured on the 2880x1620 scene:
+
+| DVR configuration | GB/day |
+| --- | --- |
+| 720p, 1 s segments, `-tune zerolatency` | 58.9 |
+| 720p, 1 s segments | 49.1 |
+| 720p, 1 s segments, CRF 34 | 17.4 |
+| **720p, 2 s segments (current)** | **14.0** |
+| 720p, 4 s segments | 9.4 |
+
+Two-second segments cost a third of the disk at the same picture quality. A CRF change buys the same saving with quality instead. `-tune zerolatency` is correct for a live view and wrong for an archive: it removes lookahead, B-frames and mb-tree, doubles the archive and costs more CPU.
+
+## Motion detection
+
+Every 5 seconds the app reads the newest live segment of each camera and runs one ffmpeg scene-score pass on it. The segments are already on disk for the live view, so detection needs one short ffmpeg call for each camera and no second decode pipeline. If the newest segment is the segment of the last tick, the app spawns nothing.
 
 ```mermaid
 flowchart TD
-  seg["newest HLS segment, already on disk for live"] --> gate{"new segment?<br/>not suppressed?"}
-  gate -->|"no: same segment, or PTZ 12s, light 45s, cooldown"| skip["nothing spawned"]
-  gate -->|yes| score["one ffmpeg pass, scene score<br/>2 to 4 fps, 160 to 320 px, 5s timeout"]
+  seg["newest HLS segment, already on disk for the live view"] --> gate{"new segment?<br/>not suppressed?"}
+  gate -->|"no: same segment, or PTZ 12 s, light 45 s, cooldown"| skip["spawn nothing"]
+  gate -->|yes| score["one ffmpeg pass, scene score<br/>2 to 4 fps, 160 to 320 px, 5 s timeout"]
   score --> verdict{"scene score"}
-  verdict -->|"under threshold"| skip
-  verdict -->|"over 0.35, whole frame moved"| night["day/night or IR light<br/>sleep 45s, no clip"]
-  verdict -->|"over threshold"| sess["motion session opens,<br/>extends while things keep moving"]
-  sess -->|"post-roll plus 1s of quiet"| cut["clip cut from segments on disk,<br/>anchored on the first frame that moved"]
+  verdict -->|"below the threshold"| skip
+  verdict -->|"above 0.35, the whole frame moved"| night["day/night switch or IR light<br/>sleep 45 s, no clip"]
+  verdict -->|"above the threshold"| sess["motion session opens<br/>and extends while movement continues"]
+  sess -->|"post-roll plus 1 s of quiet"| cut["cut the clip from the segments on disk,<br/>anchored on the first frame that moved"]
   cut --> s3["mp4 and metadata JSON to S3"]
 ```
 
-Sensitivity is per camera, and it is not only a threshold. Each level also changes how the segment gets sampled, because a cat at the far end of a field and a car at the gate are not the same detection problem:
+Sensitivity is a per-camera setting, and it changes more than a threshold. Each level also changes how the pass samples the segment. A cat at the far end of a field and a car at a gate are different detection problems.
 
 | Sensitivity | Scene threshold | Sampled at | Analysed at |
 | --- | --- | --- | --- |
@@ -59,24 +88,68 @@ Sensitivity is per camera, and it is not only a threshold. Each level also chang
 | medium | 0.035 | 2 fps | 160 px wide |
 | large | 0.07 | 2 fps | 160 px wide |
 
-Most of the work after that is deciding what to ignore. A scene score above 0.35 means the whole frame changed at once, which is a day/night switch or the IR light kicking in rather than something moving through the garden, so detection sleeps for a few seconds instead of saving a clip nobody wants. Moving the camera or toggling its light suppresses it too, for a few seconds, since a PTZ pan changes every pixel by definition.
+Most of the remaining logic decides what to ignore. A scene score above 0.35 means that the whole frame changed at one time. That is a day/night switch or the IR light, not a subject in the garden. Detection then sleeps for 45 seconds and saves no clip. A PTZ move suppresses detection for 12 seconds and a light change for 45 seconds, because a pan changes every pixel.
 
-Movement opens a session instead of firing a clip immediately. The session extends while things keep moving and closes one second after the post-roll runs out, because the segment holding the end of the event is only readable once it has been fully written. The clip is then cut from segments already on disk, anchored on the first frame that moved and stretched across the whole session. That way a slow walk up the drive is filmed from the start of the approach, not from wherever "fifteen seconds back from now" happened to land.
+Movement opens a session; it does not fire a clip immediately. The session extends while movement continues. It closes one second after the post-roll, because the segment that holds the end of the event is only readable when complete. The app then cuts the clip from the segments on disk, anchored on the first frame that moved and stretched over the whole session. A slow walk up the drive is therefore filmed from the start of the approach, not from a fixed offset before the present.
 
-### Archive and AI analysis
+## Attention zones
 
-Each clip goes to MinIO as an mp4 plus a metadata JSON. The app then samples a few frames from it (6 at 768px by default) and asks a vision model what happened.
+A motion clip says that something moved. An attention zone answers three separate questions, and the system keeps the three answers independent. A shadow can be movement, but it is neither a state change nor an entry.
 
-The app never talks to a model provider. It posts to one internal OpenAI compatible endpoint, and that is the only AI address it knows about.
+1. Where is the watched object after the camera moves?
+2. What is its physical state, for example a gate open or closed?
+3. Who crossed the threshold, in which direction, and how many were there?
+
+### Geometry
+
+The operator draws a polygon over the object. ORB features and a RANSAC homography re-register that polygon after a PTZ move. Each edit carries a `geometryRevision`. On save the new shape becomes the truth at once, and the app removes the anchors that hold the old coordinates. Without that rule the old polygon returns on the next re-registration.
+
+### State
+
+A tight crop feeds the state read, not the whole yard. The tracker sends the last three observations, so one bad frame cannot decide alone. When certified open and closed examples exist, the app sends one recent example of each before the current frames. The app accepts a high-confidence read on three frames at once, and weaker reads must repeat. The last reliable state expires after five minutes, instead of an old read becoming the present truth.
+
+### Crossings
+
+Geometry answers the third question, not language. The threshold is a separate two-point line, and the app never derives it from the polygon: the same gate serves both directions, and a polygon has no side that a user can read as "in".
+
+- Ultralytics YOLO detects people, vehicles and the six animals that COCO can name and this property holds.
+- BoT-SORT holds a numeric identity across frames **and across HLS segment boundaries**. The Python worker stays alive for this reason: it takes one JSON job per line on stdin and never rebuilds its identities.
+- Supervision `LineZone` receives those identities and the bottom-centre of each box, which is the contact point with the ground. In a high-angle view the head can stay on one side of the line while the feet are already across.
+- `LineZone` needs three confirmed frames on the far side before it reports a crossing. The line has a finite length, so a pedestrian far from the gate counts zero.
+- The detector reads 5 frames per second (`vid_stride=3` on a 15 fps camera). BoT-SORT holds the identity between those frames.
+
+One trip past the line produces one passage. A shake, a shadow or an object that stays on one side produces none. The final counts come only from the tracked identities that crossed the threshold: the vision model can describe the scene, but it can neither raise nor lower that number.
+
+### The tick loop
+
+```
+every 850 ms, for each camera:
+
+  select the oldest un-inspected segment
+     |
+     +-- attention_tracker.py         motion, zone fit, gate state       ~320 ms
+     +-- attention_object_tracker.py  YOLO + BoT-SORT crossings          ~450 ms/s
+                                      (only when a zone has a crossing rule)
+```
+
+Both workers run in parallel, so a tick costs the slower of the two. A camera with no crossing rule never starts the object tracker.
+
+The object tracker letterboxes each frame to 960 px on the long side. Any rendition 960 px or wider therefore gives it the same input. The 720p DVR rendition is 1280 px wide, so the tracker reads it and decodes fewer pixels: 745 ms per 2-second segment against 1204 ms on the native 2880x1620 copy.
+
+Every event carries the **segment** time, not the wall clock, because an event belongs to the moment it was filmed. The tracker consumes segments oldest first, so a stall replays instead of skipping footage. That order has a floor of 90 seconds: past it the tracker rejoins at the live edge and writes a `tracker_backlog` span, rather than a silent report on stale footage.
+
+## Clip analysis
+
+Each clip goes to MinIO as an mp4 and a metadata JSON. The app then samples frames from it, 6 frames at 768 px by default, and asks a vision model what happened. The app never talks to a model provider: it posts to one internal OpenAI-compatible endpoint, and that is the only AI address it knows.
 
 ```mermaid
 flowchart LR
-  app["camera app<br/>6 frames at 768px"]
+  app["camera app<br/>6 frames at 768 px"]
   router["FastAPI router<br/>authorization only"]
   llm["LiteLLM<br/>aliases, keys, limits, usage"]
   cloud["cloud vision model"]
   local["vision model on the homelab GPU"]
-  app -->|"frames plus prompt"| router
+  app -->|"frames and prompt"| router
   router --> llm
   llm -->|alias| cloud
   llm -->|alias| local
@@ -84,9 +157,9 @@ flowchart LR
   local -->|"strict JSON"| app
 ```
 
-The router does almost nothing on purpose: it checks the caller is allowed, then forwards. Model choice, keys, rate limits and usage history all live in LiteLLM, which is part of a small AI platform I built for the homelab and share between projects. Swapping a cloud model for a locally hosted one is an alias change on that side. Frame count, sampling mode and model are editable directly from the UI
+The router does very little on purpose: it authorizes the caller, then forwards. Model choice, keys, rate limits and usage history live in LiteLLM. LiteLLM belongs to a small AI platform I built for the homelab and share between projects. To replace a cloud model with a local one I change an alias on that side; the camera app does not move. Frame count, sampling mode and model are UI settings and need no restart. The clip URL travels as request metadata for usage attribution, and LiteLLM does not forward metadata to the model, so only the frames reach it.
 
-The model has to answer in this shape and nothing else. Free text fields come back in French, like the rest of the app:
+The model must answer in this shape and nothing else. Free-text fields come back in French, like the rest of the app:
 
 ```json
 {
@@ -102,23 +175,50 @@ The model has to answer in this shape and nothing else. Free text fields come ba
 }
 ```
 
-The answer then gets checked rather than trusted, which is most of the code in that path:
+The app checks that answer instead of trusting it. Those checks are most of the code on this path:
 
-- Species are restricted to a fixed vocabulary, so the model cannot name an animal the notification settings have no rule for.
-- When the local tracker has already confirmed a line crossing from a stable trajectory, the prompt states it as fact and the model is not allowed to argue with the geometry.
+- The species vocabulary is fixed, and the prompt quotes it from the same list the notification settings render. The model cannot name an animal that has no rule behind it.
+- A claim of a person or a vehicle with nothing counted behind it becomes `nothing`. That is a sentence about a dark patch of grass, not a detection.
+- An animal below 0.6 confidence is a guess about a dark shape. That threshold exists because such guesses filled one camera history with animals that were branches.
+- A missing confidence is not a low confidence, because some models never fill the field.
+- When the tracker already confirmed a crossing from a stable trajectory, the prompt states it as a fact. The model may not contradict the geometry. When no trajectory confirms them, the app strips the words `crossing`, `entrée` and `sortie` from the label and the summary.
+- DVR windows can overlap. Two clips of the same threshold, direction and crossing instant within 8 seconds stay both readable, The second carries `duplicateOf`: it raises no second notification, and its people count one time in the statistics.
+- A reasoning model can end its budget before it emits the JSON. The app retries an empty or malformed answer exactly one time, and a genuine `unknown` stays valid.
 
-### Auth
+## Alerts, reports and export
 
-Login goes through my identity provider with OIDC. Groups decide what you can do: some accounts can only watch, some can move the cameras, some get the admin panel. Sessions are server side, the stream URLs are token protected for external players.
+Web Push carries the alerts, with VAPID keys the server generates on first start. A subscription is per user and per camera, and the user chooses which alert kinds and which animal species may raise a notification.
 
-### PTZ
+The live page carries a recap panel: current state, confirmed passages, counts per subject kind over 24 hours, and a reversible filter that drives the event log and the timeline together. The app derives every number there and never reads it from the trigger. `ruleType` does not identify a crossing: the motion rule fires first, and most real passages become crossings only when the clip analysis lands.
 
-A Python script drives the cameras. It tries ONVIF first and falls back to dvrip, because some cheap cameras only answer on that protocol. Same script handles the white light (off, on, auto).
+Two read-only interfaces sit on the same store. A service-key `/internal` API serves the homelab AI platform, which builds a daily surveillance report. That layer resolves the event kind one time, so the platform never learns the storage quirks. An `/api/export` API streams NDJSON to a datalake over half-open `[from, to)` ranges, in timestamp then id order. A re-read of a range therefore gives the same answer twice. The export drops what analytics does not need: no zone geometry, no media, and `createdBy` becomes a per-deployment HMAC pseudonym.
 
-## Stack
+## Access and camera control
 
-Node.js + Express, ffmpeg, hls.js, Python (onvif, dvrip), FastAPI, LiteLLM, MinIO, Docker, Cloudflare + reverse proxy, OIDC SSO.
+Login goes through my identity provider with OIDC, and sessions are server-side. Three roles (viewer, controller and admin) carry independent rights: history, rewind, audio, camera controls, recording, alerts and zone editing. Rights can be narrowed per camera. Alert reading and zone editing are separate rights on purpose: a map of the property should not travel with permission to see what the property saw.
 
-## About the code
+The S3 bucket stays private, and a raw object URL answers `AccessDenied`. Playback goes through a route that checks the session and the camera rights. The route reads the object with the service identity, supports HTTP `Range`, and reveals neither the S3 key nor a permanent URL. External players get a token-protected `/live/channels.m3u`.
 
-The code is private as it is the software watching my own house, and publishing it next to a diagram of where the cameras sit and how the tunnels run is not something i want to show. This repo is the write-up instead.
+A Python script drives the cameras and the white light. It tries ONVIF first and falls back to dvrip, because some cheap cameras answer only on that protocol.
+
+## Client
+
+Vanilla JavaScript, no framework and no build step: 13 500 lines in the viewer plus ten small modules the tests import directly. A service worker caches the app shell and serves an offline page, while the API, the streams and the recordings stay network-only. The UI has a dark theme and a light theme. Anything drawn over the picture uses a separate palette, so it stays readable on both. The start path is ordered by need: `/api/status` first, then the cameras and HLS, then the zones, and the heavy history response last.
+
+## Stack and deployment
+
+Node.js 22 and Express, ffmpeg, hls.js, Python (OpenCV, Ultralytics YOLO, BoT-SORT, Supervision, ONVIF, dvrip), FastAPI, LiteLLM, MinIO, Docker, Cloudflare and a reverse proxy, OIDC SSO.
+
+The image installs torch from the CPU wheel index before anything that depends on it. The default index serves a CUDA build. It put 3.4 GB of `nvidia/` and `triton` into an image on a host with no GPU. The CPU index takes the image from 10.4 GB to about 7 GB. The build exports the YOLO model to OpenVINO at 960 px, and the worker falls back to PyTorch if OpenVINO inference fails. Saved-clip replay can run on a second host, over an SSH pipe through the Cloudflare tunnel: the key, the SSH config and `cloudflared` are mounted and never baked, so the image holds no credential.
+
+## Tests
+
+105 test files, about 18 000 lines: `node:test` for the JavaScript and `unittest` for the Python, plus a syntax check over every file that ships. Real footage validates detection, not hand-written fixtures. A replay reads the archived MP4 files from S3 and scores the pipeline on the actual pixels. The first version of that ground-truth manifest attributed a trajectory to the wrong clip and inverted the two directions, so it reported a false 7/7. Scores now come from the replay of the media, never from the expected coordinates.
+
+## The code is private
+
+This repository holds the write-up, the architecture diagram and the demo. The application code stays closed.
+
+The reason is not code quality. After 275 commits and 105 test files I would rather you read it. The reason is the function: this software watches my house. A public repository next to a diagram of the camera positions and the tunnel routes hands over the map and the implementation together. Closed source is not the defence here; it sits on top of the defences.
+
+The demo runs against the real deployment, not a mockup. Happy to walk through the real thing in a call, including the parts that are ugly.
