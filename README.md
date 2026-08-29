@@ -38,7 +38,7 @@ One ffmpeg process serves each camera. It decodes the RTSP feed one time and wri
 ```mermaid
 flowchart LR
   cam["camera RTSP"] --> ff["one ffmpeg process per camera<br/>one decode"]
-  ff -->|"stream copy, no encode"| live["live segments<br/>native resolution, 7 min on disk"]
+  ff -->|"stream copy"| live["live segments<br/>native resolution, 7 min on disk"]
   ff -->|"scale + x264"| dvr["DVR segments<br/>720p, 24 h on disk"]
   live --> master["master playlist<br/>two variants"]
   dvr --> master
@@ -48,7 +48,7 @@ flowchart LR
   dvr --> track
 ```
 
-The live rendition is a stream copy: no decode, no encode, no quality loss and no CPU cost. The DVR rendition is the only encode, and its height is a user setting. The player reads the master playlist and selects the native copy for quality, or the DVR rendition on a weak connection. Both playlists carry `EXT-X-PROGRAM-DATE-TIME` on every segment, so any segment maps to the wall clock without a count backwards from the end of the file.
+The live rendition is a stream copy. It keeps the original picture and costs almost no CPU. The DVR rendition is the only encode, and its height is a user setting. The player reads the master playlist and selects the native copy for quality, or the DVR rendition on a weak connection. Both playlists carry `EXT-X-PROGRAM-DATE-TIME` on every segment, so any segment maps directly to the wall clock.
 
 Segment duration controls the disk cost more than the encoder quality does. Each segment must start on a keyframe, and at 720p the keyframes are most of the archive. Measured on the 2880x1620 scene:
 
@@ -60,26 +60,26 @@ Segment duration controls the disk cost more than the encoder quality does. Each
 | **720p, 2 s segments (current)** | **14.0** |
 | 720p, 4 s segments | 9.4 |
 
-Two-second segments cost a third of the disk at the same picture quality. A CRF change buys the same saving with quality instead. `-tune zerolatency` is correct for a live view and wrong for an archive: it removes lookahead, B-frames and mb-tree, doubles the archive and costs more CPU.
+Two-second segments cost a third of the disk at the same picture quality. A CRF change buys the same saving with quality. `-tune zerolatency` suits a live view. In an archive it removes lookahead, B-frames and mb-tree, doubles the size and costs more CPU.
 
 ## Motion detection
 
-Every 5 seconds the app reads the newest live segment of each camera and runs one ffmpeg scene-score pass on it. The segments are already on disk for the live view, so detection needs one short ffmpeg call for each camera and no second decode pipeline. If the newest segment is the segment of the last tick, the app spawns nothing.
+Every 5 seconds the app reads the newest live segment of each camera and runs one ffmpeg scene-score pass on it. The segments are already on disk for the live view, so detection costs one short ffmpeg call for each camera. If the newest segment is the segment of the last tick, the app skips that camera.
 
 ```mermaid
 flowchart TD
-  seg["newest HLS segment, already on disk for the live view"] --> gate{"new segment?<br/>not suppressed?"}
-  gate -->|"no: same segment, or a suppression window"| skip["spawn nothing"]
+  seg["newest HLS segment, already on disk for the live view"] --> gate{"new segment?<br/>suppression clear?"}
+  gate -->|"no: same segment, or a suppression window"| skip["skip the camera"]
   gate -->|yes| score["one ffmpeg pass, scene score<br/>2 to 4 fps, 160 to 320 px, 5 s timeout"]
   score --> verdict{"scene score"}
   verdict -->|"below the threshold"| skip
-  verdict -->|"above 0.35, the whole frame moved"| night["day/night switch or IR light<br/>short sleep, no clip"]
+  verdict -->|"above 0.35, the whole frame moved"| night["day/night switch or IR light<br/>short sleep"]
   verdict -->|"above the threshold"| sess["motion session opens<br/>and extends while movement continues"]
   sess -->|"post-roll plus 1 s of quiet"| cut["cut the clip from the segments on disk,<br/>anchored on the first frame that moved"]
   cut --> s3["mp4 and metadata JSON to S3"]
 ```
 
-Sensitivity is a per-camera setting, and it changes more than a threshold. Each level also changes how the pass samples the segment. A cat at the far end of a field and a car at a gate are different detection problems.
+Sensitivity is a per-camera setting. Each level sets a threshold and a sampling rate together. A cat at the far end of a field and a car at a gate are different detection problems.
 
 | Sensitivity | Scene threshold | Sampled at | Analysed at |
 | --- | --- | --- | --- |
@@ -88,13 +88,13 @@ Sensitivity is a per-camera setting, and it changes more than a threshold. Each 
 | medium | 0.035 | 2 fps | 160 px wide |
 | large | 0.07 | 2 fps | 160 px wide |
 
-Most of the remaining logic decides what to ignore. A scene score above 0.35 means that the whole frame changed at one time. That is a day/night switch or the IR light, not a subject in the garden. Detection then sleeps for a few seconds and saves no clip. A PTZ move and a light change suppress detection for a few seconds too, because a pan changes every pixel.
+Most of the remaining logic decides what to ignore. A scene score above 0.35 means that the whole frame changed at one time. That is a day/night switch or the IR light. A subject in the garden changes a small part of the frame. Detection then sleeps for a few seconds and lets the segment pass. A PTZ move and a light change suppress detection for a few seconds too, because a pan changes every pixel.
 
-Movement opens a session; it does not fire a clip immediately. The session extends while movement continues. It closes one second after the post-roll, because the segment that holds the end of the event is only readable when complete. The app then cuts the clip from the segments on disk, anchored on the first frame that moved and stretched over the whole session. A slow walk up the drive is therefore filmed from the start of the approach, not from a fixed offset before the present.
+Movement opens a session. The session extends while movement continues. It closes one second after the post-roll, because the segment that holds the end of the event is only readable when complete. The app then cuts the clip from the segments on disk, anchored on the first frame that moved and stretched over the whole session. The clip therefore holds a slow walk up the drive from the start of the approach.
 
 ## Attention zones
 
-A motion clip says that something moved. An attention zone answers three separate questions, and the system keeps the three answers independent. A shadow can be movement, but it is neither a state change nor an entry.
+A motion clip says that something moved. An attention zone answers three separate questions, and the system keeps the three answers independent. A shadow causes movement in the picture. The state and the crossing count stay the same.
 
 1. Where is the watched object after the camera moves?
 2. What is its physical state, for example a gate open or closed?
@@ -102,23 +102,23 @@ A motion clip says that something moved. An attention zone answers three separat
 
 ### Geometry
 
-The operator draws a polygon over the object. ORB features and a RANSAC homography re-register that polygon after a PTZ move. Each edit carries a `geometryRevision`. On save the new shape becomes the truth at once, and the app removes the anchors that hold the old coordinates. Without that rule the old polygon returns on the next re-registration.
+The operator draws a polygon over the object. ORB features and a RANSAC homography re-register that polygon after a PTZ move. Each edit carries a `geometryRevision`. On save the new shape becomes the truth at once, and the app removes the anchors that hold the old coordinates. Before that rule, the old polygon came back on the next re-registration.
 
 ### State
 
-A tight crop feeds the state read, not the whole yard. The tracker sends the last three observations, so one bad frame cannot decide alone. When certified open and closed examples exist, the app sends one recent example of each before the current frames. The app accepts a high-confidence read on three frames at once, and weaker reads must repeat. The last reliable state expires after five minutes, instead of an old read becoming the present truth.
+A tight crop of the object feeds the state read. The tracker sends the last three observations, so three frames decide the state together. When certified open and closed examples exist, the app sends one recent example of each before the current frames. The app accepts a high-confidence read on three frames at once, and weaker reads must repeat. The last reliable state expires after five minutes.
 
 ### Crossings
 
-Geometry answers the third question, not language. The threshold is a separate two-point line, and the app never derives it from the polygon: the same gate serves both directions, and a polygon has no side that a user can read as "in".
+Geometry answers the third question. The threshold is a separate two-point line, and the operator draws it by hand. The same gate serves both directions, and only a line carries a direction that a user can read.
 
 - Ultralytics YOLO detects people, vehicles and the six animals that COCO can name and this property holds.
-- BoT-SORT holds a numeric identity across frames **and across HLS segment boundaries**. The Python worker stays alive for this reason: it takes one JSON job per line on stdin and never rebuilds its identities.
+- BoT-SORT holds a numeric identity across frames **and across HLS segment boundaries**. The Python worker stays alive for this reason: it takes one JSON job per line on stdin and keeps its identities between jobs.
 - Supervision `LineZone` receives those identities and the bottom-centre of each box, which is the contact point with the ground. In a high-angle view the head can stay on one side of the line while the feet are already across.
 - `LineZone` needs three confirmed frames on the far side before it reports a crossing. The line has a finite length, so a pedestrian far from the gate counts zero.
 - The detector reads 5 frames per second (`vid_stride=3` on a 15 fps camera). BoT-SORT holds the identity between those frames.
 
-One trip past the line produces one passage. A shake, a shadow or an object that stays on one side produces none. The final counts come only from the tracked identities that crossed the threshold: the vision model can describe the scene, but it can neither raise nor lower that number.
+One trip past the line produces one passage. A shake, a shadow or an object that stays on one side produces zero passages. The final counts come only from the tracked identities that crossed the threshold. The vision model describes the scene, and the geometry sets the number.
 
 ### The tick loop
 
@@ -132,15 +132,15 @@ every 850 ms, for each camera:
                                       (only when a zone has a crossing rule)
 ```
 
-Both workers run in parallel, so a tick costs the slower of the two. A camera with no crossing rule never starts the object tracker.
+Both workers run in parallel, so a tick costs the slower of the two. The app starts the object tracker only for a camera that has a crossing rule.
 
 The object tracker letterboxes each frame to 960 px on the long side. Any rendition 960 px or wider therefore gives it the same input. The 720p DVR rendition is 1280 px wide, so the tracker reads it and decodes fewer pixels: 745 ms per 2-second segment against 1204 ms on the native 2880x1620 copy.
 
-Every event carries the **segment** time, not the wall clock, because an event belongs to the moment it was filmed. The tracker consumes segments oldest first, so a stall replays instead of skipping footage. That order has a floor of 90 seconds: past it the tracker rejoins at the live edge and writes a `tracker_backlog` span, rather than a silent report on stale footage.
+Every event carries the **segment** time, because an event belongs to the moment it was filmed. The tracker consumes segments oldest first, so a stall replays the footage. That order has a floor of 90 seconds. Past that floor the tracker rejoins at the live edge and writes a `tracker_backlog` span.
 
 ## Clip analysis
 
-Each clip goes to MinIO as an mp4 and a metadata JSON. The app then samples frames from it, 6 frames at 768 px by default, and asks a vision model what happened. The app never talks to a model provider: it posts to one internal OpenAI-compatible endpoint, and that is the only AI address it knows.
+Each clip goes to MinIO as an mp4 and a metadata JSON. The app then samples frames from it, 6 frames at 768 px by default, and asks a vision model what happened. The app posts to one internal OpenAI-compatible endpoint. That endpoint is the only AI address it holds.
 
 ```mermaid
 flowchart LR
@@ -157,9 +157,9 @@ flowchart LR
   local -->|"strict JSON"| app
 ```
 
-The router does very little on purpose: it authorizes the caller, then forwards. Model choice, keys, rate limits and usage history live in LiteLLM. LiteLLM belongs to a small AI platform I built for the homelab and share between projects. To replace a cloud model with a local one I change an alias on that side; the camera app does not move. Frame count, sampling mode and model are UI settings and need no restart.
+The router does very little on purpose: it authorizes the caller, then forwards. Model choice, keys, rate limits and usage history live in LiteLLM. LiteLLM belongs to a small AI platform I built for the homelab and share between projects. To replace a cloud model with a local one I change an alias on that side. The camera app stays as it is. Frame count, sampling mode and model are UI settings and need no restart.
 
-The model must answer in this shape and nothing else. Free-text fields come back in French, like the rest of the app:
+The model must answer in this shape. Free-text fields come back in French, like the rest of the app:
 
 ```json
 {
@@ -175,27 +175,29 @@ The model must answer in this shape and nothing else. Free-text fields come back
 }
 ```
 
-The app checks that answer instead of trusting it. Those checks are most of the code on this path:
+The app checks that answer before it stores it. Those checks are most of the code on this path:
 
-- The species vocabulary is fixed, and the prompt quotes it from the same list the notification settings render. The model cannot name an animal that has no rule behind it.
+- The species vocabulary is fixed, and the prompt quotes it from the same list the notification settings render. The model can name only an animal that has a notification rule.
 - An animal below 0.6 confidence is a guess about a dark shape. That threshold exists because such guesses filled one camera history with animals that were branches.
-- When the tracker already confirmed a crossing from a stable trajectory, the prompt states it as a fact. The model may not contradict the geometry. When no trajectory confirms them, the app strips the words `crossing`, `entrée` and `sortie` from the label and the summary.
-- DVR windows can overlap. Two clips of the same threshold, direction and crossing instant within 8 seconds both stay readable. The second carries `duplicateOf`: it raises no second notification, and its people count one time in the statistics.
+- When the tracker already confirmed a crossing from a stable trajectory, the prompt states it as a fact. The geometry keeps authority over the answer. The app strips the words `crossing`, `entrée` and `sortie` from the label and the summary when a trajectory is absent.
+- DVR windows can overlap. Two clips of the same threshold, direction and crossing instant within 8 seconds both stay readable. The second carries `duplicateOf`: the app sends one notification, and counts its people one time.
 - A reasoning model can end its budget before it emits the JSON. The app retries an empty or malformed answer exactly one time, and a genuine `unknown` stays valid.
 
 ## Alerts, reports and export
 
 Web Push carries the alerts, with VAPID keys the server generates on first start. A subscription is per user and per camera, and the user chooses which alert kinds and which animal species may raise a notification.
 
-The live page carries a recap panel: current state, confirmed passages, counts per subject kind over 24 hours, and a reversible filter that drives the event log and the timeline together. The app derives every number there and never reads it from the trigger. `ruleType` does not identify a crossing: the motion rule fires first, and most real passages become crossings only when the clip analysis lands.
+The live page carries a recap panel: current state, confirmed passages, counts per subject kind over 24 hours, and a reversible filter that drives the event log and the timeline together. The app derives every number there from the stored analysis. `ruleType` names the rule that fired, and the motion rule fires first, so most real passages become crossings when the clip analysis lands.
 
-Two read-only interfaces sit on the same store. A service-key `/internal` API serves the homelab AI platform, which builds a daily surveillance report. That layer resolves the event kind one time, so the platform never learns the storage quirks. An `/api/export` API streams NDJSON to a datalake over half-open `[from, to)` ranges, in timestamp then id order. A re-read of a range therefore gives the same answer twice. The export drops what analytics does not need: no zone geometry, no media, and `createdBy` becomes a per-deployment HMAC pseudonym.
+Two read-only interfaces sit on the same store. A service-key `/internal` API serves the homelab AI platform, which builds a daily surveillance report. That layer resolves the event kind one time, so the platform reads one settled answer. An `/api/export` API streams NDJSON to a datalake over half-open `[from, to)` ranges, in timestamp then id order. A re-read of a range therefore gives the same answer twice.
+
+The export carries what analytics needs: event times, kinds and counts. Zone geometry and media stay inside the app, and `createdBy` becomes a per-deployment HMAC pseudonym.
 
 ## Access and camera control
 
-Login goes through my identity provider with OIDC, and sessions are server-side. Three roles (viewer, controller and admin) carry independent rights: history, rewind, audio, camera controls, recording, alerts and zone editing. Rights can be narrowed per camera. Alert reading and zone editing are separate rights on purpose: a map of the property should not travel with permission to see what the property saw.
+Login goes through my identity provider with OIDC, and sessions are server-side. Three roles (viewer, controller and admin) carry independent rights: history, rewind, audio, camera controls, recording, alerts and zone editing. Rights can be narrowed per camera. Alert reading and zone editing are separate rights on purpose. A viewer reads what the property saw, and the map of the property stays with the admin.
 
-The S3 bucket stays private, and a raw object URL answers `AccessDenied`. Playback goes through a route that checks the session and the camera rights. The route reads the object with the service identity, supports HTTP `Range`, and reveals neither the S3 key nor a permanent URL. External players get a token-protected `/live/channels.m3u`.
+The S3 bucket stays private, and a raw object URL answers `AccessDenied`. Playback goes through a route that checks the session and the camera rights. The route reads the object with the service identity, supports HTTP `Range`, and keeps the S3 key and the object URL private. External players get a token-protected `/live/channels.m3u`.
 
 A Python script drives the cameras and the white light. It tries ONVIF first and falls back to dvrip, because some cheap cameras answer only on that protocol.
 
@@ -207,16 +209,16 @@ Vanilla JavaScript, no framework and no build step: 13 500 lines in the viewer p
 
 Node.js 22 and Express, ffmpeg, hls.js, Python (OpenCV, Ultralytics YOLO, BoT-SORT, Supervision, ONVIF, dvrip), FastAPI, LiteLLM, MinIO, Docker, Cloudflare and a reverse proxy, OIDC SSO.
 
-The image installs torch from the CPU wheel index before anything that depends on it. The default index serves a CUDA build. It put 3.4 GB of `nvidia/` and `triton` into an image on a host with no GPU. The CPU index takes the image from 10.4 GB to about 7 GB. The build exports the YOLO model to OpenVINO at 960 px, and the worker falls back to PyTorch if OpenVINO inference fails. Saved-clip replay can run on a second host, over an SSH pipe through the Cloudflare tunnel: the key, the SSH config and `cloudflared` are mounted and never baked, so the image holds no credential.
+The image installs torch from the CPU wheel index before anything that depends on it. The default index serves a CUDA build. It put 3.4 GB of `nvidia/` and `triton` into an image on a host with no GPU. The CPU index takes the image from 10.4 GB to about 7 GB. The build exports the YOLO model to OpenVINO at 960 px, and the worker falls back to PyTorch if OpenVINO inference fails. Saved-clip replay can run on a second host, over an SSH pipe through the Cloudflare tunnel: the deployment mounts the key, the SSH config and `cloudflared` at run time, so the image holds no credential.
 
 ## Tests
 
-105 test files, about 18 000 lines: `node:test` for the JavaScript and `unittest` for the Python, plus a syntax check over every file that ships. Real footage validates detection, not hand-written fixtures. A replay reads the archived MP4 files from S3 and scores the pipeline on the actual pixels. The first version of that ground-truth manifest attributed a trajectory to the wrong clip and inverted the two directions, so it reported a false 7/7. Scores now come from the replay of the media, never from the expected coordinates.
+105 test files, about 18 000 lines: `node:test` for the JavaScript and `unittest` for the Python, plus a syntax check over every file that ships. Real footage validates detection. A replay reads the archived MP4 files from S3 and scores the pipeline on the actual pixels. The first version of that ground-truth manifest attributed a trajectory to the wrong clip and inverted the two directions, so it reported a false 7/7. Scores now come from the replay of the media.
 
 ## The code is private
 
 This repository holds the write-up, the architecture diagram and the demo. The application code stays closed.
 
-The reason is not code quality. After 275 commits and 105 test files I would rather you read it. The reason is the function: this software watches my house. A public repository next to a diagram of the camera positions and the tunnel routes hands over the map and the implementation together. Closed source is not the defence here; it sits on top of the defences.
+The reason is the function of the software: it watches my house. A public repository next to a diagram of the camera positions and the tunnel routes hands over the map and the implementation together. Closed source sits on top of the real defences. After 275 commits and 105 test files I would rather you read it.
 
-The demo runs against the real deployment, not a mockup. Happy to walk through the real thing in a call, including the parts that are ugly.
+The demo runs against the real deployment. Happy to walk through the real thing in a call, including the parts that are ugly.
